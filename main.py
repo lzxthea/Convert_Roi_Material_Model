@@ -18,6 +18,7 @@ from feature_all import DENSE_FEAT_2D_more, SPARSE_FEAT_v2, \
     DELTA_CAMP_FEAT, DELTA_CAMP_VMID_FEAT, DELTA_VMID_FEAT, DELTA_FEATURE_INFO
 
 from utils.feat_utils import bucket_feats, get_dense_tower, bucket_feats_2d, print_flags, bucket_single_feat_semantic
+from dynamic_bucketing_simple import SimpleDynamicBucketing, create_dynamic_bucket_feats_simple
 
 from utils.metric_utils import get_AUC
 from utils.loss_utils import get_vars_not_in_scope, get_pow_w, huber_loss, weighted_cross_entropy, cross_entropy, zlin, focal_loss
@@ -78,6 +79,9 @@ tf.app.flags.DEFINE_bool('use_log_feature', True, 'use log feature.')
 tf.app.flags.DEFINE_bool('use_din', True, 'use_din')
 tf.app.flags.DEFINE_integer('auto_type_to_keep', -1, '是否过滤')
 tf.app.flags.DEFINE_bool('enable_ad_avg_uplift', True, 'enable_ad_avg_uplift')
+tf.app.flags.DEFINE_bool('use_dynamic_bucketing', True, '是否使用动态分桶')
+tf.app.flags.DEFINE_integer('dynamic_bucketing_batches', 1000, '动态分桶统计的batch数量')
+tf.app.flags.DEFINE_string('dynamic_bucketing_path', './bucket_points.json', '动态分桶点保存路径')
 tf.app.flags.DEFINE_float('label_cap_value_lb', 0.0, 'label_cap_value_lb')
 tf.app.flags.DEFINE_float('label_cap_value_ub', 300.0, 'label_cap_value_ub')
 tf.app.flags.DEFINE_string('loss_type', 'weighted_cross_entropy, focal_loss', 'loss_type')
@@ -90,6 +94,8 @@ print('is_offline:', FLAGS.is_offline)
 print('loss_type:', FLAGS.loss_type)
 print('shuffle_buffer_size:', FLAGS.shuffle_buffer_size)
 print('cross_entropy_weight:', FLAGS.cross_entropy_weight)
+print('use_dynamic_bucketing:', FLAGS.use_dynamic_bucketing)
+print('dynamic_bucketing_batches:', FLAGS.dynamic_bucketing_batches)
 
 # --------------- init path ------------------------
 # 处理离线训练数据
@@ -215,11 +221,34 @@ def supervised_model_fn(model, features, labels, mode, params, config):
     # dense特征、campaign特征
     with tf.variable_scope("model_cur", reuse=tf.AUTO_REUSE,
                            partitioner=tf.fixed_size_partitioner(FLAGS.ps_num_embedding_shards, axis=0)):
-        # 1d特征处理
-        dense_features_1d_embeddings, dense_features_1d_names, _ = bucket_feats(
-            features, dense_features_1d, log_dict=need_log_feature, need_log1p=False, dim=EME_DIM,
-            all_feat_suffix="common"
-        )
+        # 1d特征处理 - 支持动态分桶
+        if FLAGS.use_dynamic_bucketing:
+            # 初始化动态分桶器
+            dynamic_bucketing = SimpleDynamicBucketing(
+                num_batches_for_stats=FLAGS.dynamic_bucketing_batches,
+                save_path=FLAGS.dynamic_bucketing_path
+            )
+            
+            # 尝试加载已保存的分桶点
+            dynamic_bucketing.load_bucket_points()
+            
+            # 收集特征统计信息（仅在训练模式下）
+            if mode == tf.estimator.ModeKeys.TRAIN and not dynamic_bucketing.is_initialized:
+                dynamic_bucketing.collect_feature_stats(features, list(dense_features_1d.keys()))
+            
+            # 使用动态分桶处理1D特征
+            dense_features_1d_embeddings, dense_features_1d_names = create_dynamic_bucket_feats_simple(
+                features, dense_features_1d, dynamic_bucketing,
+                log_dict=need_log_feature, need_log1p=False, dim=EME_DIM,
+                all_feat_suffix="common"
+            )
+        else:
+            # 使用原始静态分桶
+            dense_features_1d_embeddings, dense_features_1d_names, _ = bucket_feats(
+                features, dense_features_1d, log_dict=need_log_feature, need_log1p=False, dim=EME_DIM,
+                all_feat_suffix="common"
+            )
+        
         state_embeddings_names += dense_features_1d_names
         for t in TASK_NAME:
             state_embeddings_mt[t] += dense_features_1d_embeddings
